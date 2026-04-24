@@ -7,11 +7,14 @@ Trades the recurring pattern of AI semiconductor stocks (NVDA, AVGO, TSM / SMH):
 
 Signal: 4-component composite (term structure, IV/RV spread, correlation, skew)
 Trade:  Short underlying + long ATM straddles when composite ≤ 15th percentile
+Capital: $10,000 starting capital — all P&L expressed in USD
 
 Usage:
     python complacency_fade_strategy.py              # full backtest + charts
     python complacency_fade_strategy.py --live       # print today's live signal
     python complacency_fade_strategy.py --mc         # add Monte Carlo (slow, ~5min)
+
+Requirements: pip install yfinance pandas numpy scipy matplotlib
 """
 
 import argparse
@@ -73,6 +76,9 @@ CFG = dict(
     gamma_multiplier = 25.0,          # lower to reflect real straddle payoff structure
     vol_move_beta    = 0.40,          # sensitivity of straddle to IV changes
 
+    # Capital
+    starting_capital = 10_000,        # USD
+
     # Monte Carlo
     mc_paths         = 1000,
     mc_seed          = 42,
@@ -84,110 +90,14 @@ CFG = dict(
 # ─────────────────────────────────────────────────────────────
 
 def fetch_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
-    """
-    Try yfinance first; fall back to synthetic data calibrated to real AI-semi behavior.
-    Synthetic data reproduces the key statistical properties: stochastic vol, fat tails,
-    regime clustering, and realistic AI-boom-era price levels (2021-2026).
-    """
-    try:
-        raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            prices = raw["Close"][tickers].dropna(how="all")
-        else:
-            prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
-        if len(prices) > 100:
-            return prices.ffill().dropna()
-    except Exception:
-        pass
+    """Download adjusted close prices for all tickers via yfinance."""
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)
+    if isinstance(raw.columns, pd.MultiIndex):
+        prices = raw["Close"][tickers].dropna(how="all")
+    else:
+        prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
+    return prices.ffill().dropna()
 
-    print("  ⚠️  Live data unavailable — using calibrated synthetic prices")
-    return _generate_synthetic_prices(tickers, start, end)
-
-
-def _generate_synthetic_prices(tickers: list[str], start: str, end: str) -> pd.DataFrame:
-    """
-    Generate realistic synthetic prices for NVDA/AVGO/TSM/SMH/^VXN
-    using parameters calibrated from actual 2021-2026 data.
-    """
-    rng = np.random.default_rng(2021)
-
-    dates = pd.bdate_range(start=start, end=end)
-    n = len(dates)
-
-    # Calibrated params per ticker — reflects actual 2021-2026 AI-semi volatility
-    params = {
-        "NVDA": dict(s0=15.0,  drift=0.0006, vol_base=0.45, beta=1.6, t_df=3.8),
-        "AVGO": dict(s0=500.0, drift=0.0003, vol_base=0.30, beta=1.1, t_df=4.2),
-        "TSM":  dict(s0=110.0, drift=0.0002, vol_base=0.33, beta=1.2, t_df=4.5),
-        "SMH":  dict(s0=220.0, drift=0.0003, vol_base=0.36, beta=1.3, t_df=4.0),
-        "^VXN": dict(s0=25.0,  drift=0.0000, vol_base=0.00, beta=0.0, t_df=4.0),
-    }
-
-    # ── Shared market factor: stochastic vol (OU) with realistic calm/panic cycles ──
-    vol_path = np.zeros(n)
-    vol_path[0] = 0.30
-
-    # Simulate a rough "calm → crash → recovery" calendar to mimic 2021-2026
-    # Embedded shocks: ~2022 bear, ~2023 AI boom, ~2024 correction, ~2025-26 chop
-    shock_days = {
-        int(n * 0.18): +0.22,   # 2022 bear-market vol spike
-        int(n * 0.22): +0.18,
-        int(n * 0.38): -0.10,   # 2023 vol compression (AI optimism)
-        int(n * 0.55): +0.14,   # 2024 correction
-        int(n * 0.70): -0.08,
-        int(n * 0.82): +0.10,
-    }
-
-    for t in range(1, n):
-        base_shock = rng.standard_normal()
-        regime_add = shock_days.get(t, 0)
-        # Also sprinkle small random regime shocks
-        random_event = rng.standard_normal() * 0.04 if rng.random() < 0.008 else 0
-        vol_path[t] = np.clip(
-            vol_path[t-1]
-            + 0.08 * (0.32 - vol_path[t-1]) / 252
-            + 0.14 / np.sqrt(252) * base_shock
-            + regime_add / 252
-            + random_event,
-            0.10, 0.85)
-
-    # Market returns: fat-tailed, proportional to vol_path
-    mkt_shocks = rng.standard_t(4.0, size=n)
-    mkt_scale  = np.sqrt(4.0 / (4.0 - 2))
-    mkt_ret    = vol_path / np.sqrt(252) * mkt_shocks / mkt_scale
-
-    out = {}
-    for ticker in tickers:
-        if ticker not in params:
-            continue
-        p = params[ticker]
-        price = np.zeros(n)
-        price[0] = p["s0"]
-
-        if ticker == "^VXN":
-            # VXN tracks vol_path scaled to realistic index levels (15–60)
-            price = np.clip(vol_path * 90, 14, 62)
-        else:
-            idio_shocks = rng.standard_t(p["t_df"], size=n)
-            idio_scale  = np.sqrt((p["t_df"] - 2) / p["t_df"])
-            for t in range(1, n):
-                # Idiosyncratic noise with moderate weight vs market factor
-                idio = (p["vol_base"] * 0.35 / np.sqrt(252)
-                        * idio_shocks[t] / idio_scale)
-                ret  = p["drift"] + p["beta"] * mkt_ret[t] + idio
-
-                # Hard event shocks: ~2.5 per year per stock
-                if rng.random() < 0.010:
-                    # Mix: mostly negative (export bans, earnings misses)
-                    direction = rng.choice([-1, -1, -1, 1])
-                    ret += direction * rng.uniform(0.04, 0.11)
-
-                price[t] = price[t-1] * (1 + ret)
-
-        out[ticker] = price
-
-    df = pd.DataFrame(out, index=dates)
-    return df
 
 
 # ─────────────────────────────────────────────────────────────
@@ -299,7 +209,7 @@ def run_backtest(prices: pd.DataFrame, feat: pd.DataFrame,
     # Basket return (equal-weight constituents)
     basket_rets = prices[cfg["constituents"]].pct_change().mean(axis=1).reindex(feat.index)
 
-    equity = 1.0
+    equity = cfg["starting_capital"]
     in_trade  = False
     entry_day = None
     entry_idx_price = None
@@ -382,7 +292,7 @@ def run_backtest(prices: pd.DataFrame, feat: pd.DataFrame,
             in_trade = False
             action   = "EXIT"
 
-        equity = max(equity + daily_pnl, 0.001)
+        equity = max(equity + daily_pnl, 1.0)
 
         daily_records.append({
             "date":     date,
@@ -421,16 +331,20 @@ def calc_metrics(equity: pd.Series, trades: list[dict], years: float) -> dict:
     avg_hold   = np.mean([t["hold_days"] for t in trades]) if trades else 0
 
     return dict(
-        total_return    = total_ret,
-        ann_return      = ann_ret,
-        sharpe          = sharpe,
-        max_drawdown    = max_dd,
-        n_trades        = len(trades),
-        win_rate        = win_rate,
-        profit_factor   = profit_factor,
-        avg_hold        = avg_hold,
-        avg_win         = np.mean(wins)   if wins   else 0,
-        avg_loss        = np.mean(losses) if losses else 0,
+        starting_capital = equity.iloc[0],
+        final_value      = equity.iloc[-1],
+        net_profit       = equity.iloc[-1] - equity.iloc[0],
+        total_return     = total_ret,
+        ann_return       = ann_ret,
+        sharpe           = sharpe,
+        max_drawdown     = max_dd,
+        max_drawdown_usd = max_dd * equity.iloc[0],
+        n_trades         = len(trades),
+        win_rate         = win_rate,
+        profit_factor    = profit_factor,
+        avg_hold         = avg_hold,
+        avg_win          = np.mean(wins)   if wins   else 0,
+        avg_loss         = np.mean(losses) if losses else 0,
     )
 
 
@@ -494,7 +408,7 @@ def run_monte_carlo(cfg: dict, n_paths: int = 1000,
         comp_pct  = percentile_rank(composite, rw)
 
         # Simulate trades
-        equity = 1.0
+        equity = cfg["starting_capital"]
         in_trade = False
         hold_count = 0
         entry_equity = 1.0
@@ -536,7 +450,7 @@ def run_monte_carlo(cfg: dict, n_paths: int = 1000,
                     trade_rets_sim.append(equity / entry_equity - 1)
                     in_trade = False
 
-            equity = max(equity + daily_pnl, 0.001)
+            equity = max(equity + daily_pnl, 1.0)
             eq_curve.append(equity)
 
         eq_s = pd.Series(eq_curve)
@@ -614,18 +528,20 @@ def plot_backtest(equity_df: pd.DataFrame, trades: list[dict],
     eq = equity_df["equity"]
 
     # ── Equity curve ──────────────────────────────────────────
-    ax_eq.plot(eq.index, eq.values * 100, color=PALETTE["green"], lw=1.8, label="Strategy")
+    ax_eq.plot(eq.index, eq.values, color=PALETTE["green"], lw=1.8, label="Strategy")
     # shade in-trade periods
     in_trade_mask = equity_df["in_trade"]
     for i in range(len(equity_df)):
         if in_trade_mask.iloc[i]:
             ax_eq.axvspan(equity_df.index[i], equity_df.index[min(i+1, len(equity_df)-1)],
                           alpha=0.08, color=PALETTE["blue"], lw=0)
-    ax_eq.set_title("Portfolio Equity Curve  (start = 100)", fontsize=11, pad=8)
-    ax_eq.set_ylabel("Equity", color=PALETTE["subtext"])
-    ax_eq.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}"))
+    ax_eq.set_title("Portfolio Equity Curve  (starting capital $10,000)", fontsize=11, pad=8)
+    ax_eq.set_ylabel("Portfolio Value ($)", color=PALETTE["subtext"])
+    ax_eq.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
     # stats box
-    stats_txt = (f"Total: {metrics['total_return']*100:+.1f}%   "
+    stats_txt = (f"Start: ${metrics['starting_capital']:,.0f}   "
+                 f"End: ${metrics['final_value']:,.0f}   "
+                 f"Net P&L: ${metrics['net_profit']:+,.0f}   "
                  f"Ann: {metrics['ann_return']*100:+.1f}%   "
                  f"Sharpe: {metrics['sharpe']:.2f}   "
                  f"MaxDD: {metrics['max_drawdown']*100:.1f}%   "
@@ -636,11 +552,12 @@ def plot_backtest(equity_df: pd.DataFrame, trades: list[dict],
                bbox=dict(facecolor=PALETTE["panel"], edgecolor=PALETTE["border"], pad=4))
 
     # ── Drawdown ───────────────────────────────────────────────
-    peak = eq.cummax()
-    dd   = (eq - peak) / peak * 100
-    ax_dd.fill_between(dd.index, dd.values, 0, color=PALETTE["red"], alpha=0.7)
-    ax_dd.set_title("Drawdown (%)", fontsize=10)
-    ax_dd.set_ylabel("%", color=PALETTE["subtext"])
+    peak    = eq.cummax()
+    dd_usd  = eq - peak          # dollar drawdown (always ≤ 0)
+    ax_dd.fill_between(dd_usd.index, dd_usd.values, 0, color=PALETTE["red"], alpha=0.7)
+    ax_dd.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+    ax_dd.set_title("Drawdown ($)", fontsize=10)
+    ax_dd.set_ylabel("$", color=PALETTE["subtext"])
 
     # ── Composite signal ──────────────────────────────────────
     comp = feat["composite_pct"].reindex(equity_df.index)
@@ -794,16 +711,19 @@ def print_metrics(metrics: dict, label: str = "Backtest Results"):
     print(f"\n{'─'*50}")
     print(f"  {label}")
     print(f"{'─'*50}")
-    print(f"  Total Return:    {metrics['total_return']*100:+.1f}%")
-    print(f"  Annual Return:   {metrics['ann_return']*100:+.1f}%")
-    print(f"  Sharpe Ratio:    {metrics['sharpe']:.2f}")
-    print(f"  Max Drawdown:    {metrics['max_drawdown']*100:.1f}%")
-    print(f"  # Trades:        {metrics['n_trades']}")
-    print(f"  Win Rate:        {metrics['win_rate']*100:.0f}%")
-    print(f"  Profit Factor:   {metrics['profit_factor']:.2f}")
-    print(f"  Avg Hold:        {metrics['avg_hold']:.1f} days")
-    print(f"  Avg Win:         {metrics['avg_win']*100:+.1f}%")
-    print(f"  Avg Loss:        {metrics['avg_loss']*100:+.1f}%")
+    print(f"  Starting Capital: ${metrics['starting_capital']:>10,.2f}")
+    print(f"  Final Value:      ${metrics['final_value']:>10,.2f}")
+    print(f"  Net Profit:       ${metrics['net_profit']:>+10,.2f}")
+    print(f"  Total Return:      {metrics['total_return']*100:>+9.1f}%")
+    print(f"  Annual Return:     {metrics['ann_return']*100:>+9.1f}%")
+    print(f"  Sharpe Ratio:      {metrics['sharpe']:>10.2f}")
+    print(f"  Max Drawdown:      {metrics['max_drawdown']*100:>9.1f}%  (${abs(metrics['max_drawdown_usd']):,.2f})")
+    print(f"  # Trades:          {metrics['n_trades']:>10}")
+    print(f"  Win Rate:          {metrics['win_rate']*100:>9.0f}%")
+    print(f"  Profit Factor:     {metrics['profit_factor']:>10.2f}")
+    print(f"  Avg Hold:          {metrics['avg_hold']:>9.1f} days")
+    print(f"  Avg Win:           {metrics['avg_win']*100:>+9.1f}%")
+    print(f"  Avg Loss:          {metrics['avg_loss']*100:>+9.1f}%")
     print(f"{'─'*50}\n")
 
 
@@ -860,7 +780,7 @@ def main():
 
         print("\n📊  Generating Monte Carlo charts …")
         plot_monte_carlo(mc_df, metrics, "outputs/complacency_fade_mc.png")
-        mc_df.to_csv("/mnt/user-data/outputs/monte_carlo_results.csv", index=False)
+        mc_df.to_csv("outputs/monte_carlo_results.csv", index=False)
         print("  ✓ MC results saved → monte_carlo_results.csv")
 
 
